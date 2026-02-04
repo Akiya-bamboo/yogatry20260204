@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Pose Detection Stable</title>
+
+<style>
+body {
+  margin: 0;
+  background: black;
+  color: white;
+  text-align: center;
+  font-family: sans-serif;
+}
+
+video, canvas {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%) scaleX(-1);
+}
+</style>
+</head>
+
+<body>
+
+<h2>拜日式引導</h2>
+<p id="stateText">目前狀態：尚未開始偵測</p>
+<p id="hintText">登入與課前說明完成後，系統會自動切換到這個畫面並開始拜日式引導。</p>
+
+<video id="video" autoplay playsinline width="640" height="480"></video>
+<canvas id="canvas" width="640" height="480"></canvas>
+
+<!-- MediaPipe Pose 與 Drawing Utils -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+<script>
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const stateText = document.getElementById("stateText");
+const hintText = document.getElementById("hintText");
+
+// ===== 語音工具（溫柔、陪伴型口氣）=====
+const LANG = "zh-TW";
+let isSpeaking = false;
+
+function speak(text, { rate = 1.0, pitch = 1.0 } = {}) {
+  if (!("speechSynthesis" in window)) return Promise.resolve();
+
+  window.speechSynthesis.cancel();
+
+  return new Promise(resolve => {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = LANG;
+    u.rate = rate;
+    u.pitch = pitch;
+    u.onstart = () => { isSpeaking = true; };
+    u.onend = () => { isSpeaking = false; resolve(); };
+    u.onerror = () => { isSpeaking = false; resolve(); };
+    window.speechSynthesis.speak(u);
+  });
+}
+
+function gentleGuide(text) {
+  // 稍微慢一點、音調柔和一點
+  return speak(text, { rate: 0.95, pitch: 1.0 });
+}
+
+function gentleEncourage(text) {
+  return speak(text, { rate: 0.98, pitch: 1.05 });
+}
+
+// ===== 角度計算工具 =====
+function angleBetweenPoints(a, b, c) {
+  // 回傳以 b 為中心，a-b-c 的夾角（0–180）
+  if (!a || !b || !c) return null;
+  const abx = a.x - b.x;
+  const aby = a.y - b.y;
+  const cbx = c.x - b.x;
+  const cby = c.y - b.y;
+
+  const abLen = Math.hypot(abx, aby);
+  const cbLen = Math.hypot(cbx, cby);
+  if (!abLen || !cbLen) return null;
+
+  const dot = abx * cbx + aby * cby;
+  let cos = dot / (abLen * cbLen);
+  cos = Math.max(-1, Math.min(1, cos));
+  const rad = Math.acos(cos);
+  return rad * 180 / Math.PI;
+}
+
+function shinAngleFromVertical(knee, ankle) {
+  // 小腿向量與「垂直方向」的夾角（0 表示完全垂直，越大表示越斜）
+  if (!knee || !ankle) return null;
+  const vx = ankle.x - knee.x;
+  const vy = ankle.y - knee.y;
+  const len = Math.hypot(vx, vy);
+  if (!len) return null;
+  // 垂直方向取 (0, 1) / (0, -1) 都一樣，因此取 vy/len 的絕對值
+  let cos = Math.abs(vy / len);
+  cos = Math.max(-1, Math.min(1, cos));
+  const rad = Math.acos(cos);
+  return rad * 180 / Math.PI;
+}
+
+function avgIgnoreNull(values) {
+  const filtered = values.filter(v => typeof v === "number" && !Number.isNaN(v));
+  if (!filtered.length) return null;
+  return filtered.reduce((a, b) => a + b, 0) / filtered.length;
+}
+
+// ===== 拜日式狀態機 =====
+const STABLE_MS = 1500;     // 姿勢需穩定 1.5 秒才算完成
+const PROMPT_COOLDOWN = 3500; // 同一姿勢語音間隔至少 3.5 秒
+
+const sunStates = [
+  {
+    id: "prayer_1",
+    label: "祈禱式（一）",
+    guide: "我們先的慢慢站直，雙腳穩穩踩在地上，雙手在胸口前輕輕合十。請慢慢找到自己的平衡，不用急。",
+    promptText: "請慢慢站直，不用急。找一個舒服、穩定的站姿就好。",
+    successPhrases: [
+      "很好，站得很穩。",
+      "做得很棒，我會陪你慢慢往下一步。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const shinL = shinAngleFromVertical(l[25], l[27]);
+      const shinR = shinAngleFromVertical(l[26], l[28]);
+      const shin = avgIgnoreNull([shinL, shinR]);
+      if (shin == null) return { ok: false };
+      // 祈禱式：小腿大致垂直，與垂直夾角 < 15 度視為穩定
+      const ok = shin < 15;
+      const near = shin < 30;
+      return { ok, near };
+    }
+  },
+  {
+    id: "forward_fold_1",
+    label: "前彎（一）",
+    guide: "接下來，慢慢從髖關節向前折疊，上身朝向大腿。膝蓋可以微微彎曲，舒服最重要。",
+    promptText: "試著讓上身慢慢靠近大腿，如果覺得緊，也可以只到自己覺得可以的範圍。",
+    successPhrases: [
+      "很好，上身放得很穩。",
+      "做得很好，保持自然呼吸就好。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const hipL = angleBetweenPoints(l[11], l[23], l[25]);
+      const hipR = angleBetweenPoints(l[12], l[24], l[26]);
+      const kneeL = angleBetweenPoints(l[23], l[25], l[27]);
+      const kneeR = angleBetweenPoints(l[24], l[26], l[28]);
+      const hip = avgIgnoreNull([hipL, hipR]);
+      const knee = avgIgnoreNull([kneeL, kneeR]);
+      if (hip == null || knee == null) return { ok: false };
+      const ok = hip > 60 && knee < 150;
+      const near = hip > 50 && knee < 160;
+      return { ok, near };
+    }
+  },
+  {
+    id: "spine_extend",
+    label: "脊椎延伸",
+    guide: "現在從前彎慢慢抬高一點點背部，像是把脊椎往前延伸拉長，眼神看向前方或微微向下。",
+    promptText: "慢慢抬高背部延伸，不需要完全挺直，只要感覺背部被溫柔地拉長就好。",
+    successPhrases: [
+      "很好，背部延伸得很漂亮。",
+      "做得很棒，維持你現在舒服的高度就可以。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const hipL = angleBetweenPoints(l[11], l[23], l[25]);
+      const hipR = angleBetweenPoints(l[12], l[24], l[26]);
+      const kneeL = angleBetweenPoints(l[23], l[25], l[27]);
+      const kneeR = angleBetweenPoints(l[24], l[26], l[28]);
+      const hip = avgIgnoreNull([hipL, hipR]);
+      const knee = avgIgnoreNull([kneeL, kneeR]);
+      if (hip == null || knee == null) return { ok: false };
+      const ok = hip < 50 && knee < 150;
+      const near = hip < 60 && knee < 160;
+      return { ok, near };
+    }
+  },
+  {
+    id: "step_back",
+    label: "腳往後踩",
+    guide: "接著，請把一隻腳輕輕往後踩，前腳膝蓋可以彎曲，後腳膝蓋也可以落地，找到穩定的弓箭步。",
+    promptText: "雙腳慢慢往後，一步一步就好，感覺身體被溫柔地向前拉長。",
+    successPhrases: [
+      "很好，重心穩穩地落在雙腳之間。",
+      "做得很好，保持自然呼吸。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const shinL = shinAngleFromVertical(l[25], l[27]);
+      const shinR = shinAngleFromVertical(l[26], l[28]);
+      const shin = Math.max(shinL ?? 0, shinR ?? 0);
+      if (!shin && shin !== 0) return { ok: false };
+      // 腳往後踩：其中一邊小腿明顯傾斜，與垂直夾角 > 25
+      const ok = shin > 25;
+      const near = shin > 15;
+      return { ok, near };
+    }
+  },
+  {
+    id: "down_dog_1",
+    label: "下犬式（一）",
+    guide: "從弓箭步慢慢把臀部往後、往上抬，像是把身體變成一個倒 V 型。腳跟不需要完全貼地，舒服就好。",
+    promptText: "試著讓背部朝向天花板打直，如果覺得腿緊，可以微微彎膝。",
+    successPhrases: [
+      "很好，整個背部線條很漂亮。",
+      "做得很棒，記得讓肩膀放鬆、脖子自然。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const shoulderL = angleBetweenPoints(l[11], l[13], l[15]);
+      const shoulderR = angleBetweenPoints(l[12], l[14], l[16]);
+      const elbowL = angleBetweenPoints(l[23], l[11], l[13]); // 粗略判斷手臂彎曲
+      const elbowR = angleBetweenPoints(l[24], l[12], l[14]);
+      const shoulder = avgIgnoreNull([shoulderL, shoulderR]);
+      const elbow = avgIgnoreNull([elbowL, elbowR]);
+      if (shoulder == null || elbow == null) return { ok: false };
+      const ok = shoulder < 145 && elbow < 145;
+      const near = shoulder < 160 && elbow < 160;
+      return { ok, near };
+    }
+  },
+  {
+    id: "plank",
+    label: "平板式",
+    guide: "我們慢慢往前移動身體，讓肩膀大約在手腕上方，身體像一條直線一樣延伸。",
+    promptText: "試著讓肩膀大約對齊手腕，身體像一塊穩穩的木板。覺得吃力隨時可以先休息。",
+    successPhrases: [
+      "很好，核心啟動得很扎實。",
+      "做得很棒，記得維持自然呼吸，不要憋氣。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const shoulderL = angleBetweenPoints(l[11], l[13], l[15]);
+      const shoulderR = angleBetweenPoints(l[12], l[14], l[16]);
+      const hipL = angleBetweenPoints(l[11], l[23], l[25]);
+      const hipR = angleBetweenPoints(l[12], l[24], l[26]);
+      const kneeL = angleBetweenPoints(l[23], l[25], l[27]);
+      const kneeR = angleBetweenPoints(l[24], l[26], l[28]);
+      const shoulder = avgIgnoreNull([shoulderL, shoulderR]);
+      const hip = avgIgnoreNull([hipL, hipR]);
+      const knee = avgIgnoreNull([kneeL, kneeR]);
+      if (shoulder == null || hip == null || knee == null) return { ok: false };
+      const ok = shoulder > 100 && hip < 150 && knee < 160;
+      const near = shoulder > 90 && hip < 165 && knee < 170;
+      return { ok, near };
+    }
+  },
+  {
+    id: "cobra",
+    label: "眼鏡蛇式",
+    guide: "從平板慢慢放低身體，接著讓胸口溫柔地打開，抬起上半身。下半身可以放鬆貼在瑜珈墊上。",
+    promptText: "慢慢抬起上半身，肩膀遠離耳朵，不需要撐到極限，只要覺得胸口有一點展開就很好。",
+    successPhrases: [
+      "很好，胸口打開得很溫柔。",
+      "做得很好，記得讓下背維持舒服的感覺。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const hipL = angleBetweenPoints(l[11], l[23], l[25]);
+      const hipR = angleBetweenPoints(l[12], l[24], l[26]);
+      const shoulderL = angleBetweenPoints(l[23], l[11], l[13]);
+      const shoulderR = angleBetweenPoints(l[24], l[12], l[14]);
+      const hip = avgIgnoreNull([hipL, hipR]);
+      const shoulder = avgIgnoreNull([shoulderL, shoulderR]);
+      if (hip == null || shoulder == null) return { ok: false };
+      const ok = hip >= 90 && hip <= 160 && shoulder > 50;
+      const near = hip >= 80 && hip <= 170 && shoulder > 40;
+      return { ok, near };
+    }
+  },
+  {
+    id: "down_dog_2",
+    label: "下犬式（二）",
+    guide: "我們再一次回到下犬式，慢慢把臀部往後、往上帶，讓背部再次延伸。",
+    promptText: "背部試著打直，腳跟不一定要碰到地板，只要你覺得穩就可以。",
+    successPhrases: [
+      "很好，又回到穩定的下犬式。",
+      "做得很棒，呼吸保持順暢就好。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const shoulderL = angleBetweenPoints(l[11], l[13], l[15]);
+      const shoulderR = angleBetweenPoints(l[12], l[14], l[16]);
+      const elbowL = angleBetweenPoints(l[23], l[11], l[13]);
+      const elbowR = angleBetweenPoints(l[24], l[12], l[14]);
+      const shoulder = avgIgnoreNull([shoulderL, shoulderR]);
+      const elbow = avgIgnoreNull([elbowL, elbowR]);
+      if (shoulder == null || elbow == null) return { ok: false };
+      const ok = shoulder < 145 && elbow < 145;
+      const near = shoulder < 160 && elbow < 160;
+      return { ok, near };
+    }
+  },
+  {
+    id: "forward_fold_2",
+    label: "前彎（二）",
+    guide: "從下犬式慢慢把腳往前走回手的方向，上身再次朝向大腿放鬆垂下。",
+    promptText: "試著讓上身靠近大腿，如果覺得拉得很緊，可以多彎一點膝蓋。",
+    successPhrases: [
+      "很好，又回到前彎的位置。",
+      "做得很棒，讓頭頸完全放鬆。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const hipL = angleBetweenPoints(l[11], l[23], l[25]);
+      const hipR = angleBetweenPoints(l[12], l[24], l[26]);
+      const kneeL = angleBetweenPoints(l[23], l[25], l[27]);
+      const kneeR = angleBetweenPoints(l[24], l[26], l[28]);
+      const hip = avgIgnoreNull([hipL, hipR]);
+      const knee = avgIgnoreNull([kneeL, kneeR]);
+      if (hip == null || knee == null) return { ok: false };
+      const ok = hip > 60 && knee < 150;
+      const near = hip > 50 && knee < 160;
+      return { ok, near };
+    }
+  },
+  {
+    id: "prayer_2",
+    label: "祈禱式（二）",
+    guide: "最後，慢慢一節一節把身體捲起來回到站立，雙手再次在胸口前合十，感受一下全身的變化。",
+    promptText: "請慢慢站直，不用急，找到一個穩穩又放鬆的站姿。",
+    successPhrases: [
+      "很好，完成一整套拜日式。",
+      "做得非常棒，謝謝你和身體一起完成這一輪練習。"
+    ],
+    check(landmarks) {
+      const l = landmarks;
+      const shinL = shinAngleFromVertical(l[25], l[27]);
+      const shinR = shinAngleFromVertical(l[26], l[28]);
+      const shin = avgIgnoreNull([shinL, shinR]);
+      if (shin == null) return { ok: false };
+      const ok = shin < 15;
+      const near = shin < 30;
+      return { ok, near };
+    }
+  }
+];
+
+let currentIndex = 0;
+let stableSince = null;
+let lastPromptAt = 0;
+let lastStateIdSpoken = null;
+let flowCompleted = false;
+
+function setStateLabel(text) {
+  stateText.textContent = "目前狀態：" + text;
+}
+
+function setHint(text) {
+  hintText.textContent = text;
+}
+
+function randomFrom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+async function onPoseState(landmarks) {
+  if (flowCompleted || !landmarks) return;
+
+  const now = performance.now();
+  const state = sunStates[currentIndex];
+  if (!state) return;
+
+  const { ok, near } = state.check(landmarks);
+
+  // 初次進入狀態時，做一次溫柔說明
+  if (lastStateIdSpoken !== state.id) {
+    lastStateIdSpoken = state.id;
+    setStateLabel(state.label);
+    setHint("小提醒：" + state.promptText);
+    await gentleGuide(state.guide);
+  }
+
+  // 控制提示頻率，避免洗頻
+  const canPrompt = now - lastPromptAt > PROMPT_COOLDOWN && !isSpeaking;
+
+  if (ok) {
+    // 姿勢已達成，檢查穩定時間
+    if (stableSince == null) {
+      stableSince = now;
+    }
+
+    const heldMs = now - stableSince;
+
+    if (heldMs >= STABLE_MS) {
+      // 避免在同一幀重複完成
+      stableSince = now;
+
+      // 成功鼓勵語
+      if (canPrompt) {
+        lastPromptAt = now;
+        await gentleEncourage(randomFrom(state.successPhrases));
+      }
+
+      // 切換到下一個狀態
+      currentIndex++;
+      stableSince = null;
+      lastStateIdSpoken = null;
+
+      if (currentIndex >= sunStates.length) {
+        flowCompleted = true;
+        setStateLabel("拜日式已完成");
+        setHint("你已經完成一整套拜日式，可以慢慢回到自然站姿或休息。");
+        await gentleEncourage("恭喜你完成一整套拜日式，做得非常棒。可以給自己一點時間，好好感受身體的變化。");
+      }
+
+      return;
+    }
+  } else {
+    // 尚未達成，重置穩定時間
+    stableSince = null;
+
+    // 如果姿勢有一點接近，偶爾給溫柔提示
+    if (near && canPrompt) {
+      lastPromptAt = now;
+      await gentleGuide(state.promptText);
+    }
+  }
+}
+
+// ===== MediaPipe Pose 初始化（僅在橋接頁切進來後才開始）=====
+let pose = null;
+let poseStarted = false;
+
+async function startPoseFlow() {
+  if (poseStarted) return;
+  poseStarted = true;
+
+  setStateLabel("準備開始拜日式");
+  setHint("鏡頭即將啟動，如果你還沒站好位置，可以先調整一下。");
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+    video.srcObject = stream;
+  } catch (err) {
+    alert("Camera error: " + err);
+    setHint("鏡頭啟動失敗，請檢查是否允許使用攝影機。");
+    return;
+  }
+
+  // 初始化 Pose
+  pose = new Pose({
+    locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${file}`
+  });
+
+  pose.setOptions({
+    modelComplexity: 1,
+    smoothLandmarks: true,
+    enableSegmentation: false,
+    minDetectionConfidence: 0.5,
+    minTrackingConfidence: 0.5
+  });
+
+  pose.onResults(results => {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    if (results.poseLandmarks) {
+      drawConnectors(ctx, results.poseLandmarks, POSE_CONNECTIONS, {
+        color: "#00FFFF",
+        lineWidth: 3
+      });
+
+      drawLandmarks(ctx, results.poseLandmarks, {
+        color: "#FF5809",
+        radius: 4
+      });
+
+      onPoseState(results.poseLandmarks);
+    }
+  });
+
+  async function detectFrame() {
+    if (!pose) return;
+    await pose.send({ image: video });
+    requestAnimationFrame(detectFrame);
+  }
+
+  video.onloadeddata = () => {
+    detectFrame();
+  };
+
+  await gentleGuide("鏡頭已經準備好，接下來我會一步一步陪你完成一整套拜日式。當你準備好，就跟著我的引導慢慢移動身體。");
+}
+
+// 由外層 bridge.html 控制：收到 START_POSE 訊號後，才真正啟動 Pose
+window.addEventListener("load", () => {
+  setStateLabel("等待開始拜日式");
+  setHint("當登入與課前說明完成後，系統會自動幫你切到這個畫面。收到開始指令後，才會開啟鏡頭與拜日式偵測。");
+
+  window.addEventListener("message", (event) => {
+    if (event.data === "START_POSE") {
+      startPoseFlow();
+    }
+  });
+
+  // 開發模式：若是直接開啟此頁（不在 iframe 裡），可在數秒後自動啟動方便測試
+  if (window === window.parent) {
+    setTimeout(() => {
+      if (!poseStarted) {
+        startPoseFlow();
+      }
+    }, 3000);
+  }
+});
+</script>
+
+</body>
+</html>
+
